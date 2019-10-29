@@ -80,7 +80,7 @@ az aks get-credentials -g $aksClusterGroupName -n $aksClusterName
             --scope "$nodeResourceGroupName"
     ```
 
-### Using a Service Principal
+### Using Service Principal
 It is also possible to provide AGIC access to ARM via a Kubernetes secret.
 
 1. Create an Active Directory Service Principal and encode with base64. The base64 encoding is required for the JSON blob to be saved to Kubernetes.
@@ -141,13 +141,13 @@ helm install add-pod-identity/aad-pod-identity --set rbac.enabled=true # false i
 
 ### Install Ingress Controller Helm Chart
 
-1. Add the AGIC Helm repository:
+1. Add the AGIC Helm repository
     ```bash
     helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
     helm repo update
     ```
 
-1. Install AGIC:
+1. Install AGIC using helm. You can provide additional [helm options](../helm) during installation or you can also create a [helm-config.yaml](../examples/sample-helm-config.yaml).
     ```bash
     # Using User assigned identity
     helm install application-gateway-kubernetes-ingress/ingress-azure \

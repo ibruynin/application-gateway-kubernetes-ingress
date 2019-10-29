@@ -148,14 +148,13 @@ helm install add-pod-identity/aad-pod-identity --set rbac.enabled=true # false i
 
 ### Install Ingress Controller Helm Chart
 
-1. Add the AGIC Helm repository:
+1. Add the AGIC Helm repository
     ```bash
     helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
     helm repo update
     ```
 
-1. Install AGIC
-
+1. Install AGIC using helm. You can provide additional [helm options](../helm) during installation or you can also create a [helm-config.yaml](../examples/sample-helm-config.yaml).
     > **Note**: It is really important to set `appgw.shared=true` if you want to preserve the existing request rules on Application Gateway. If not, then set appgw.shared=false. Please refer to [Multi-cluster / Shared App Gateway documentation](../features/shared-app-gateway) to understand how sharing of Application Gateway works.
 
     ```bash
