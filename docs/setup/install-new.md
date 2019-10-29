@@ -22,103 +22,39 @@ choose to use another environment, please ensure the following command line tool
 1. `jq` - command-line JSON processor: [installation instructions](https://stedolan.github.io/jq/download/)
 
 
-### Create an Identity
+### Deploy AKS with Azure network plugin
 
-Follow the steps below to create an Azure Active Directory (AAD) [service principal object](https://docs.microsoft.com/en-us/azure/active-directory/develop/app-objects-and-service-principals#service-principal-object). Please record the `appId`, `password`, and `objectId` values - these will be used in the following steps.
+```bash
+group="ingress-appgw"
+clusterName="aks-cluster"
+location="westeurope"
+az group create -g $group -l "$location"
 
-1. Create AD service principal ([Read more about RBAC](https://docs.microsoft.com/en-us/azure/role-based-access-control/overview)). Paste the following lines in your [Azure Cloud Shell](https://shell.azure.com/):
-    ```bash
-    az ad sp create-for-rbac --skip-assignment -o json > auth.json
-    appId=$(jq -r ".appId" auth.json)
-    password=$(jq -r ".password" auth.json)
-    ```
-        These commands will create `appId` and `password` bash variables, which will be used in the steps below. You can view the value of these with `echo $appId` and `echo $password`.
+# add --disable-rbac if you want to deploy k8s without rbac
+az aks create -g $group -n $clusterName --node-count 3 --network-plugin azure
 
+# get cluster credentials
+az aks get-credentials -g $group -n $clusterName
+```
 
-1. Execute the next command in [Cloud Shell](https://shell.azure.com/) to create the `objectId` bash variable, which is the new Service Princpial:
-    ```bash
-    objectId=$(az ad sp show --id $appId --query "objectId" -o tsv)
-    ```
-    The `objectId` bash variable will be used in the ARM template below. View the value with `echo $objectId`.
+### Deploy User assigned Identity for AGIC with requried RBACs in Agent Pool resource group
 
-1. Paste the entire command below (it is a single command on multiple lines) in [Cloud Shell](https://shell.azure.com/) to create the parameters.json file. It will be used in the ARM template deployment.
-    ```bash
-    cat <<EOF > parameters.json
-    {
-      "aksServicePrincipalAppId": { "value": "$appId" },
-      "aksServicePrincipalClientSecret": { "value": "$password" },
-      "aksServicePrincipalObjectId": { "value": "$objectId" },
-      "aksEnableRBAC": { "value": false }
-    }
-    EOF
-    ```
-    To deploy an **RBAC** enabled cluster, set the `aksEnabledRBAC` field to `true`. View the contents of the newly created file with `cat parameters.json`. It will contain the values of the `appId`, `password`, and `objectId` bash variables from the previous steps.
+```bash
+identityName="agic-identity"
+nodeResourceGroupName=$(az aks show -g $group -n $clusterName --query "nodeResourceGroup" -o tsv)
+nodeResourceGroupId=$(az group show -g $nodeResourceGroupName --query "id" -o tsv)
 
-### Deploy Components
-The next few steps will add the following list of components to your Azure subscription:
+az identity create -n $identityName -g $nodeResourceGroupName -l $location
+identityPrincipalId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "principalId" -o tsv)
+identityResourceId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "id" -o tsv)
+identityClientId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "clientId" -o tsv)
 
-- [Azure Kubernetes Service](https://docs.microsoft.com/en-us/azure/aks/intro-kubernetes)
-- [Application Gateway](https://docs.microsoft.com/en-us/azure/application-gateway/overview) v2
-- [Virtual Network](https://docs.microsoft.com/en-us/azure/virtual-network/virtual-networks-overview) with 2 [subnets](https://docs.microsoft.com/en-us/azure/virtual-network/virtual-networks-overview)
-- [Public IP Address](https://docs.microsoft.com/en-us/azure/virtual-network/virtual-network-public-ip-address)
-- [Managed Identity](https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/overview), which will be used by [AAD Pod Identity](https://github.com/Azure/aad-pod-identity/blob/master/README.md)
-
-1. Download the ARM template into template.json file. Paste the following in your [shell](https://shell.azure.com/):
-    ```bash
-    wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/deploy/azuredeploy.json -O template.json
-    ```
-
-1. Deploy the ARM template via [Azure Cloud Shell](https://shell.azure.com/) and the `az` tool. Modify the name of the resource group and region/location, then paste each of the following lines into your [shell](https://shell.azure.com/):
-    ```bash
-    resourceGroupName="MyResourceGroup"
-
-    location="westus2"
-
-    deploymentName="ingress-appgw"
-
-    az group create -n $resourceGroupName -l $location
-
-    az group deployment create -g $resourceGroupName -n $deploymentName --template-file template.json --parameters parameters.json
-    ```
-    Note: The last command may take a few minutes to complete.
-
-1. Once the deployment finished, download the deployment output into a file named `deployment-outputs.json`.
-    ```bash
-    az group deployment show -g $resourceGroupName -n $deploymentName --query "properties.outputs" -o json > deployment-outputs.json
-    ```
-    View the content of the newly created file with: `cat deployment-outputs.json`. The file will have the following shape (example):
-    ```json
-    {
-      "aksApiServerAddress": {
-        "type": "String",
-        "value": "aks-abcd41e9.hcp.westus2.azmk8s.io"
-      },
-      "aksClusterName": {
-        "type": "String",
-        "value": "aksabcd"
-      },
-      "applicationGatewayName": {
-        "type": "String",
-        "value": "applicationgatewayabcd"
-      },
-      "identityClientId": {
-        "type": "String",
-        "value": "7b1a3378-8abe-ab58-cca9-a8ef624db293"
-      },
-      "identityResourceId": {
-        "type": "String",
-        "value": "/subscriptions/a6466a81-bf0d-147e-2acb-a0ba50f6456e/resourceGroups/MyResourceGroup/providers/Microsoft.ManagedIdentity/userAssignedIdentities/appgwContrIdentityabcd"
-      },
-      "resourceGroupName": {
-        "type": "String",
-        "value": "MyResourceGroup"
-      },
-      "subscriptionId": {
-        "type": "String",
-        "value": "a6466a81-bf0d-147e-2acb-a0ba50f6456e"
-      }
-    }
-    ```
+# if this fails with "No matches in graph database for ...", then try again.
+az role assignment create \
+        --role Contributor \
+        --assignee "$identityPrincipalId" \
+        --scope "$nodeResourceGroupId"
+```
 
 ## Set up Application Gateway Ingress Controller
 
@@ -126,20 +62,7 @@ With the instructions in the previous section we created and configured a new AK
 an App Gateway. We are now ready to deploy a sample app and an ingress controller to our new
 Kubernetes infrastructure.
 
-### Setup Kubernetes Credentials
-For the following steps we need setup [kubectl](https://kubectl.docs.kubernetes.io/) command,
-which we will use to connect to our new Kubernetes cluster. [Cloud Shell](https://shell.azure.com/) has `kubectl` already installed. We will use `az` CLI to obtain credentials for Kubernetes.
-
-Get credentials for your newly deployed AKS ([read more](https://docs.microsoft.com/en-us/azure/aks/kubernetes-walkthrough#connect-to-the-cluster)):
-```bash
-# use the deployment-outputs.json created after deployment to get the cluster name and resource group name
-aksClusterName=$(jq -r ".aksClusterName.value" deployment-outputs.json)
-resourceGroupName=$(jq -r ".resourceGroupName.value" deployment-outputs.json)
-
-az aks get-credentials --resource-group $resourceGroupName --name $aksClusterName
-```
-
-### Install AAD Pod Identity
+### Install AAD Pod Identity (skip if already installed)
   Azure Active Directory Pod Identity provides token-based access to
   [Azure Resource Manager (ARM)](https://docs.microsoft.com/en-us/azure/azure-resource-manager/resource-group-overview).
 
@@ -163,7 +86,7 @@ az aks get-credentials --resource-group $resourceGroupName --name $aksClusterNam
   kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment.yaml
   ```
 
-### Install Helm
+### Install Helm (skip if already installed)
 [Helm](https://docs.microsoft.com/en-us/azure/aks/kubernetes-helm) is a package manager for
 Kubernetes. We will leverage it to install the `application-gateway-kubernetes-ingress` package:
 
@@ -191,57 +114,17 @@ Kubernetes. We will leverage it to install the `application-gateway-kubernetes-i
 
 ### Install Ingress Controller Helm Chart
 
-1. Use the `deployment-outputs.json` file created above and create the following variables.
     ```bash
-    applicationGatewayName=$(jq -r ".applicationGatewayName.value" deployment-outputs.json)
-    resourceGroupName=$(jq -r ".resourceGroupName.value" deployment-outputs.json)
-    subscriptionId=$(jq -r ".subscriptionId.value" deployment-outputs.json)
-    identityClientId=$(jq -r ".identityClientId.value" deployment-outputs.json)
-    identityResourceId=$(jq -r ".identityResourceId.value" deployment-outputs.json)
-    ```
-1. Download [helm-config.yaml](../examples/sample-helm-config.yaml), which will configure AGIC:
-    ```bash
-    wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/docs/examples/sample-helm-config.yaml -O helm-config.yaml
-    ```
+    applicationGatewayName="appgw"
+    subnetPrefix="10.1.0.0/16"
 
-1. Edit the newly downloaded [helm-config.yaml](../examples/sample-helm-config.yaml) and fill out the sections `appgw` and `armAuth`.
-    ```bash
-    sed -i "s|<subscriptionId>|${subscriptionId}|g" helm-config.yaml
-    sed -i "s|<resourceGroupName>|${resourceGroupName}|g" helm-config.yaml
-    sed -i "s|<applicationGatewayName>|${applicationGatewayName}|g" helm-config.yaml
-    sed -i "s|<identityResourceId>|${identityResourceId}|g" helm-config.yaml
-    sed -i "s|<identityClientId>|${identityClientId}|g" helm-config.yaml
-
-    # You can further modify the helm config to enable/disable features
-    nano helm-config.yaml
-    ```
-
-   Values:
-     - `verbosityLevel`: Sets the verbosity level of the AGIC logging infrastructure. See [Logging Levels](https://github.com/Azure/application-gateway-kubernetes-ingress/blob/463a87213bbc3106af6fce0f4023477216d2ad78/docs/troubleshooting.md#logging-levels) for possible values.
-     - `appgw.subscriptionId`: The Azure Subscription ID in which App Gateway resides. Example: `a123b234-a3b4-557d-b2df-a0bc12de1234`
-     - `appgw.resourceGroup`: Name of the Azure Resource Group in which App Gateway was created. Example: `app-gw-resource-group`
-     - `appgw.name`: Name of the Application Gateway. Example: `applicationgatewayd0f0`
-     - `appgw.shared`: This boolean flag should be defaulted to `false`. Set to `true` should you need a [Shared App Gateway](https://github.com/Azure/application-gateway-kubernetes-ingress/blob/072626cb4e37f7b7a1b0c4578c38d1eadc3e8701/docs/setup/install-existing.md#multi-cluster--shared-app-gateway).
-     - `kubernetes.watchNamespace`: Specify the name space, which AGIC should watch. This could be a single string value, or a comma-separated list of namespaces.
-    - `armAuth.type`: could be `aadPodIdentity` or `servicePrincipal`
-    - `armAuth.identityResourceID`: Resource ID of the Azure Managed Identity
-    - `armAuth.identityClientId`: The Client ID of the Identity. See below for more information on Identity
-    - `armAuth.secretJSON`: Only needed when Service Principal Secret type is chosen (when `armAuth.type` has been set to `servicePrincipal`) 
-
-
-   Note on Identity: The `identityResourceID` and `identityClientID` are values that were created
-   during the [Create an Identity](https://github.com/Azure/application-gateway-kubernetes-ingress/blob/072626cb4e37f7b7a1b0c4578c38d1eadc3e8701/docs/setup/install-new.md#create-an-identity)
-   steps, and could be obtained again using the following command:
-   ```bash
-   az identity show -g <resource-group> -n <identity-name>
-   ```
-   `<resource-group>` in the command above is the resource group of your App Gateway. `<identity-name>` is the name of the created identity. All identities for a given subscription can be listed using: `az identity list`
-
-
-1. Install the Application Gateway ingress controller package:
-
-    ```bash
-    helm install -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure
+    helm install application-gateway-kubernetes-ingress/ingress-azure \
+      --set appgw.name=$applicationGatewayName \
+      --set appgw.subnetPrefix=$subnetPrefix \
+      --set armAuth.type=aadPodIdentity \
+      --set armAuth.identityResourceID=$identityResourceId \
+      --set armAuth.identityClientID=$identityClientId \
+      --version 0.10.0-rc5
     ```
 
 ### Install a Sample App
