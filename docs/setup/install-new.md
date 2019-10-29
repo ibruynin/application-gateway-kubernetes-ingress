@@ -1,7 +1,16 @@
 # Greenfield Deployment
 
-The instructions below assume Application Gateway Ingress Controller (AGIC) will be
-installed in an environment with no pre-existing components.
+The App Gateway Ingress Controller (AGIC) is a pod within your Kubernetes cluster.
+AGIC monitors the Kubernetes [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+resources, and creates and applies App Gateway config based on these.
+
+### Outline:
+- [Deploy an AKS cluster with Azure network plugin](#deploy-an-aks-cluster-with-azure-network-plugin)
+- [Setup Azure Resource Manager Authentication (ARM)](#setup-azure-resource-manager-authentication-arm)
+    - Option 1: [Using User assigned Identity](#using-user-assigned-identity)
+    - Option 2: [Using a Service Principal](#using-service-principal)
+- [Install Ingress Controller using Helm](#install-ingress-controller-helm-chart)
+- [Install a Sample App](#install-a-sample-app)
 
 ### Required Command Line Tools
 
@@ -19,15 +28,19 @@ choose to use another environment, please ensure the following command line tool
 1. `az` - Azure CLI: [installation instructions](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli?view=azure-cli-latest)
 1. `kubectl` - Kubernetes command-line tool: [installation instructions](https://kubernetes.io/docs/tasks/tools/install-kubectl)
 1. `helm` - Kubernetes package manager: [installation instructions](https://github.com/helm/helm/releases/latest)
+1. `jq` - command-line JSON processor: [installation instructions](https://stedolan.github.io/jq/download/)
 
 ## Setup variables
 
 ```bash
+# provide information which will be used to create a setup
 applicationGatewayName="appgw" # If this is subseuent run, app gateway may already exists. AGIC will target it.
 applicationGatewaySubnetPrefix="10.1.0.0/16" # This will be used to deploy a new subnet in agent pool's vnet if the subnet doesn't exists
 aksClusterName="aksCluster"
 aksClusterGroupName="aks-ingress-appgw"
 location="westeurope" # AKS cluster and App Gateway will be deployed here
+
+# name of the user assigned identity which will be created below
 agicIdentityName="agic-identity"
 ```
 
@@ -49,13 +62,14 @@ az aks get-credentials -g $aksClusterGroupName -n $aksClusterName
 
 1. Create a User assigned Identity in AKS Agent Pool's resource group
     ```bash
-    nodeResourceGroupName=$(az aks show -g $group -n $clusterName --query "nodeResourceGroup" -o tsv)
+    # Create identity in agent pool's resource group
+    nodeResourceGroupName=$(az aks show -n $aksClusterName -g $aksClusterGroupName --query "nodeResourceGroup" -o tsv)
     nodeResourceGroupId=$(az group show -g $nodeResourceGroupName --query "id" -o tsv)
 
-    az identity create -n $identityName -g $nodeResourceGroupName -l $location
-    identityPrincipalId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "principalId" -o tsv)
-    identityResourceId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "id" -o tsv)
-    identityClientId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "clientId" -o tsv)
+    az identity create -n $agicIdentityName -g $nodeResourceGroupName -l $location
+    identityPrincipalId=$(az identity show -n $agicIdentityName -g $nodeResourceGroupName --query "principalId" -o tsv)
+    identityResourceId=$(az identity show -n $agicIdentityName -g $nodeResourceGroupName --query "id" -o tsv)
+    identityClientId=$(az identity show -n $agicIdentityName -g $nodeResourceGroupName --query "clientId" -o tsv)
     ```
 
 1. Assign `Contributor` role to the Application Gateway resource group. If this step fails with "No matches in graph database for ...", then try again after few seconds.
@@ -142,7 +156,7 @@ helm install add-pod-identity/aad-pod-identity --set rbac.enabled=true # false i
       --set armAuth.type=aadPodIdentity \
       --set armAuth.identityResourceID=$identityResourceId \
       --set armAuth.identityClientID=$identityClientId \
-      --set rbac.enabled=true # false if RBAC is disabled on cluster (default is enabled)
+      --set rbac.enabled=true \ # false if RBAC is disabled on cluster (default is enabled)
       --version 0.10.0-rc5
 
     # Using Service principal
@@ -151,7 +165,7 @@ helm install add-pod-identity/aad-pod-identity --set rbac.enabled=true # false i
     #   --set appgw.subnetPrefix=$applicationGatewaySubnetPrefix \
     #   --set armAuth.type=servicePrincipal \
     #   --set armAuth.secretJSON=$spBase64Encoded \
-    #   --set rbac.enabled=true
+    #   --set rbac.enabled=true \ # false if RBAC is disabled on cluster (default is enabled)
     #   --version 0.10.0-rc5
     ```
 
