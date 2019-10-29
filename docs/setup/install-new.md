@@ -19,42 +19,70 @@ choose to use another environment, please ensure the following command line tool
 1. `az` - Azure CLI: [installation instructions](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli?view=azure-cli-latest)
 1. `kubectl` - Kubernetes command-line tool: [installation instructions](https://kubernetes.io/docs/tasks/tools/install-kubectl)
 1. `helm` - Kubernetes package manager: [installation instructions](https://github.com/helm/helm/releases/latest)
-1. `jq` - command-line JSON processor: [installation instructions](https://stedolan.github.io/jq/download/)
 
-
-### Deploy AKS with Azure network plugin
+## Setup variables
 
 ```bash
-group="ingress-appgw"
-clusterName="aks-cluster"
-location="westeurope"
-az group create -g $group -l "$location"
+applicationGatewayName="appgw" # If this is subseuent run, app gateway may already exists. AGIC will target it.
+applicationGatewaySubnetPrefix="10.1.0.0/16" # This will be used to deploy a new subnet in agent pool's vnet if the subnet doesn't exists
+aksClusterName="aksCluster"
+aksClusterGroupName="aks-ingress-appgw"
+location="westeurope" # AKS cluster and App Gateway will be deployed here
+agicIdentityName="agic-identity"
+```
+
+## Deploy an AKS cluster with Azure network plugin
+
+```bash
+az group create -g $aksClusterGroupName -l "$location"
 
 # add --disable-rbac if you want to deploy k8s without rbac
-az aks create -g $group -n $clusterName --node-count 3 --network-plugin azure
+az aks create -g $aksClusterGroupName -n $aksClusterName --node-count 3 --network-plugin azure
 
-# get cluster credentials
-az aks get-credentials -g $group -n $clusterName
+# get cluster credentials will set the kubeconfig with cluster credentials
+az aks get-credentials -g $aksClusterGroupName -n $aksClusterName
 ```
 
-### Deploy User assigned Identity for AGIC with requried RBACs in Agent Pool resource group
+## Setup Azure Resource Manager Authentication (ARM)
 
-```bash
-identityName="agic-identity"
-nodeResourceGroupName=$(az aks show -g $group -n $clusterName --query "nodeResourceGroup" -o tsv)
-nodeResourceGroupId=$(az group show -g $nodeResourceGroupName --query "id" -o tsv)
+### Using User assigned Identity
 
-az identity create -n $identityName -g $nodeResourceGroupName -l $location
-identityPrincipalId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "principalId" -o tsv)
-identityResourceId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "id" -o tsv)
-identityClientId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "clientId" -o tsv)
+1. Create a User assigned Identity in AKS Agent Pool's resource group
+    ```bash
+    nodeResourceGroupName=$(az aks show -g $group -n $clusterName --query "nodeResourceGroup" -o tsv)
+    nodeResourceGroupId=$(az group show -g $nodeResourceGroupName --query "id" -o tsv)
 
-# if this fails with "No matches in graph database for ...", then try again.
-az role assignment create \
-        --role Contributor \
-        --assignee "$identityPrincipalId" \
-        --scope "$nodeResourceGroupId"
-```
+    az identity create -n $identityName -g $nodeResourceGroupName -l $location
+    identityPrincipalId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "principalId" -o tsv)
+    identityResourceId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "id" -o tsv)
+    identityClientId=$(az identity show -n $identityName -g $nodeResourceGroupName --query "clientId" -o tsv)
+    ```
+
+1. Assign `Contributor` role to the Application Gateway resource group. If this step fails with "No matches in graph database for ...", then try again after few seconds.
+    ```bash
+    az role assignment create \
+            --role Contributor \
+            --assignee "$identityPrincipalId" \
+            --scope "$nodeResourceGroupName"
+    ```
+
+### Using a Service Principal
+It is also possible to provide AGIC access to ARM via a Kubernetes secret.
+
+1. Create an Active Directory Service Principal and encode with base64. The base64 encoding is required for the JSON blob to be saved to Kubernetes.
+    ```bash
+    az ad sp create-for-rbac --subscription <subscription-uuid> --sdk-auth > auth.json
+    spBase64Encoded=$(cat auth.json | base64 -w0)
+    spAppId=$(jq -r ".appId" auth.json)
+    ```
+
+1. Assign `Contributor` role to the Application Gateway resource group.
+    ```bash
+    az role assignment create \
+            --role Contributor \
+            --assignee "$spAppId" \
+            --scope "$nodeResourceGroupName"
+    ```
 
 ## Set up Application Gateway Ingress Controller
 
@@ -62,49 +90,42 @@ With the instructions in the previous section we created and configured a new AK
 an App Gateway. We are now ready to deploy a sample app and an ingress controller to our new
 Kubernetes infrastructure.
 
-### Install AAD Pod Identity (skip if already installed)
-  Azure Active Directory Pod Identity provides token-based access to
-  [Azure Resource Manager (ARM)](https://docs.microsoft.com/en-us/azure/azure-resource-manager/resource-group-overview).
+<details>
+<summary><strong>Install Helm (skip if already installed)</strong></summary>
 
-  [AAD Pod Identity](https://github.com/Azure/aad-pod-identity) will add the following components to your Kubernetes cluster:
-   1. Kubernetes [CRDs](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/): `AzureIdentity`, `AzureAssignedIdentity`, `AzureIdentityBinding`
-   1. [Managed Identity Controller (MIC)](https://github.com/Azure/aad-pod-identity#managed-identity-controllermic) component
-   1. [Node Managed Identity (NMI)](https://github.com/Azure/aad-pod-identity#node-managed-identitynmi) component
-
-
-  To install AAD Pod Identity to your cluster:
-
-   - *RBAC enabled* AKS cluster
-
-  ```bash
-  kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment-rbac.yaml
-  ```
-
-   - *RBAC disabled* AKS cluster
-
-  ```bash
-  kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment.yaml
-  ```
-
-### Install Helm (skip if already installed)
 [Helm](https://docs.microsoft.com/en-us/azure/aks/kubernetes-helm) is a package manager for
 Kubernetes. We will leverage it to install the `application-gateway-kubernetes-ingress` package:
-
-1. Install [Helm](https://docs.microsoft.com/en-us/azure/aks/kubernetes-helm) and run the following to add `application-gateway-kubernetes-ingress` helm package:
-
-    - *RBAC enabled* AKS cluster
-
+- *RBAC enabled* AKS cluster
     ```bash
     kubectl create serviceaccount --namespace kube-system tiller-sa
     kubectl create clusterrolebinding tiller-cluster-rule --clusterrole=cluster-admin --serviceaccount=kube-system:tiller-sa
     helm init --tiller-namespace kube-system --service-account tiller-sa
     ```
 
-    - *RBAC disabled* AKS cluster
-
+- *RBAC disabled* AKS cluster
     ```bash
     helm init
     ```
+</details>
+
+<details>
+<summary><strong>Install AAD Pod Identity (skip if already installed or using service principal for authentication)</strong></summary>
+Azure Active Directory Pod Identity provides token-based access to [Azure Resource Manager (ARM)](https://docs.microsoft.com/en-us/azure/azure-resource-manager/resource-group-overview).
+
+[AAD Pod Identity](https://github.com/Azure/aad-pod-identity) will add the following components to your Kubernetes cluster:
+1. Kubernetes [CRDs](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/): `AzureIdentity`, `AzureAssignedIdentity`, `AzureIdentityBinding`
+1. [Managed Identity Controller (MIC)](https://github.com/Azure/aad-pod-identity#managed-identity-controllermic) component
+1. [Node Managed Identity (NMI)](https://github.com/Azure/aad-pod-identity#node-managed-identitynmi) component
+
+To install AAD Pod Identity to your cluster:
+```bash
+helm repo add add-pod-identity https://raw.githubusercontent.com/Azure/aad-pod-identity/master/charts
+helm repo update
+helm install add-pod-identity/aad-pod-identity --set rbac.enabled=true # false if RBAC is disabled on cluster (default is enabled)
+```
+</details>
+
+### Install Ingress Controller Helm Chart
 
 1. Add the AGIC Helm repository:
     ```bash
@@ -112,19 +133,26 @@ Kubernetes. We will leverage it to install the `application-gateway-kubernetes-i
     helm repo update
     ```
 
-### Install Ingress Controller Helm Chart
-
+1. Install AGIC:
     ```bash
-    applicationGatewayName="appgw"
-    subnetPrefix="10.1.0.0/16"
-
+    # Using User assigned identity
     helm install application-gateway-kubernetes-ingress/ingress-azure \
       --set appgw.name=$applicationGatewayName \
-      --set appgw.subnetPrefix=$subnetPrefix \
+      --set appgw.subnetPrefix=$applicationGatewaySubnetPrefix \
       --set armAuth.type=aadPodIdentity \
       --set armAuth.identityResourceID=$identityResourceId \
       --set armAuth.identityClientID=$identityClientId \
+      --set rbac.enabled=true # false if RBAC is disabled on cluster (default is enabled)
       --version 0.10.0-rc5
+
+    # Using Service principal
+    # helm install application-gateway-kubernetes-ingress/ingress-azure \
+    #   --set appgw.name=$applicationGatewayName \
+    #   --set appgw.subnetPrefix=$applicationGatewaySubnetPrefix \
+    #   --set armAuth.type=servicePrincipal \
+    #   --set armAuth.secretJSON=$spBase64Encoded \
+    #   --set rbac.enabled=true
+    #   --version 0.10.0-rc5
     ```
 
 ### Install a Sample App

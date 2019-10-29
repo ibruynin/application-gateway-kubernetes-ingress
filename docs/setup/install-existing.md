@@ -27,10 +27,112 @@ Please __backup your App Gateway's configuration__ before installing AGIC:
 The zip file you downloaded will have JSON templates, bash, and PowerShell scripts you could use to restore App
 Gateway should that become necessary
 
-### Install Helm
+### Required Command Line Tools
+
+We recommend the use of [Azure Cloud Shell](https://shell.azure.com/) for all command line operations below. Launch your shell from shell.azure.com or by clicking the link:
+
+[![Embed launch](https://shell.azure.com/images/launchcloudshell.png "Launch Azure Cloud Shell")](https://shell.azure.com)
+
+Alternatively, launch Cloud Shell from Azure portal using the following icon:
+
+![Portal launch](../portal-launch-icon.png)
+
+Your [Azure Cloud Shell](https://shell.azure.com/) already has all necessary tools. Should you
+choose to use another environment, please ensure the following command line tools are installed:
+
+1. `az` - Azure CLI: [installation instructions](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli?view=azure-cli-latest)
+1. `kubectl` - Kubernetes command-line tool: [installation instructions](https://kubernetes.io/docs/tasks/tools/install-kubectl)
+1. `helm` - Kubernetes package manager: [installation instructions](https://github.com/helm/helm/releases/latest)
+1. `jq` - command-line JSON processor: [installation instructions](https://stedolan.github.io/jq/download/)
+
+## Setup variables
+
+```bash
+applicationGatewayName="<application-gateway-name>"
+applicationGatewayGroupName="<application-gateway-group-name>"
+aksClusterName="<aks-cluster-name>"
+aksClusterGroupName="<aks-cluster-group-name>"
+agicIdentityName="agic-identity"
+```
+
+## Setup Azure Resource Manager Authentication (ARM)
+
+### Using User assigned Identity
+
+1. Create a User assigned Identity in AKS Agent Pool's resource group
+    ```bash
+    # Create identity in agent pool's resource group
+    nodeResourceGroupName=$(az aks show -n $aksClusterName -g $aksClusterGroupName --query "nodeResourceGroup" -o tsv)
+    nodeResourceGroupId=$(az group show -g $nodeResourceGroupName --query "id" -o tsv)
+
+    az identity create -n $agicIdentityName -g $nodeResourceGroupName -l $location
+    identityPrincipalId=$(az identity show -n $agicIdentityName -g $nodeResourceGroupName --query "principalId" -o tsv)
+    identityResourceId=$(az identity show -n $agicIdentityName -g $nodeResourceGroupName --query "id" -o tsv)
+    identityClientId=$(az identity show -n $agicIdentityName -g $nodeResourceGroupName --query "clientId" -o tsv)
+    ```
+
+1. Assign `Contributor` role to the Application Gateway resource group. If this step fails with "No matches in graph database for ...", then try again after few seconds.
+    ```bash
+    applicationGatewayGroupId=$(az group show -g $applicationGatewayGroupName -o tsv --query "id")
+
+    az role assignment create \
+            --role Contributor \
+            --assignee "$identityPrincipalId" \
+            --scope "$applicationGatewayGroupId"
+    ```
+
+### Using a Service Principal
+It is also possible to provide AGIC access to ARM via a Kubernetes secret.
+
+ 1. Create an Active Directory Service Principal and encode with base64. The base64 encoding is required for the JSON blob to be saved to Kubernetes.
+    ```bash
+    az ad sp create-for-rbac --subscription <subscription-uuid> --sdk-auth > auth.json
+    spBase64Encoded=$(cat auth.json | base64 -w0)
+    spAppId=$(jq -r ".appId" auth.json)
+    ```
+
+1. Assign `Contributor` role to the Application Gateway resource group.
+    ```bash
+    applicationGatewayGroupId=$(az group show -g $applicationGatewayGroupName -o tsv --query "id")
+
+    az role assignment create \
+            --role Contributor \
+            --assignee "$spAppId" \
+            --scope "$applicationGatewayGroupId"
+    ```
+
+## Set up Application Gateway Ingress Controller
+
+With the instructions in the previous section we created and configured a new AKS cluster and
+an App Gateway. We are now ready to deploy a sample app and an ingress controller to our new
+Kubernetes infrastructure.
+
+<details>
+<summary><strong>Install AAD Pod Identity (skip if already installed or using service principal for authentication)</strong></summary>
+Azure Active Directory Pod Identity provides token-based access to [Azure Resource Manager (ARM)](https://docs.microsoft.com/en-us/azure/azure-resource-manager/resource-group-overview).
+
+[AAD Pod Identity](https://github.com/Azure/aad-pod-identity) will add the following components to your Kubernetes cluster:
+1. Kubernetes [CRDs](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/): `AzureIdentity`, `AzureAssignedIdentity`, `AzureIdentityBinding`
+1. [Managed Identity Controller (MIC)](https://github.com/Azure/aad-pod-identity#managed-identity-controllermic) component
+1. [Node Managed Identity (NMI)](https://github.com/Azure/aad-pod-identity#node-managed-identitynmi) component
+
+To install AAD Pod Identity to your cluster:
+
+- *RBAC enabled* AKS cluster
+    ```bash
+    kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment-rbac.yaml
+    ```
+
+- *RBAC disabled* AKS cluster
+    ```bash
+    kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment.yaml
+    ```
+</details>
+
+<details>
+<summary><strong>Install Helm (skip if already installed)</strong></summary>
 [Helm](https://docs.microsoft.com/en-us/azure/aks/kubernetes-helm) is a package manager for
-Kubernetes. We will leverage it to install the `application-gateway-kubernetes-ingress` package.
-Use [Cloud Shell](https://shell.azure.com/) to install Helm:
+Kubernetes. We will leverage it to install the `application-gateway-kubernetes-ingress` package:
 
 1. Install [Helm](https://docs.microsoft.com/en-us/azure/aks/kubernetes-helm) and run the following to add `application-gateway-kubernetes-ingress` helm package:
 
@@ -53,126 +155,27 @@ Use [Cloud Shell](https://shell.azure.com/) to install Helm:
     helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
     helm repo update
     ```
+</details>
 
-### Azure Resource Manager Authentication
+### Install Ingress Controller Helm Chart
 
-AGIC communicates with the Kubernetes API server and the Azure Resource Manager. It requires an identity to access
-these APIs.
-
-### Set up AAD Pod Identity
-
-[AAD Pod Identity](https://github.com/Azure/aad-pod-identity) is a controller, similar to AGIC, which also runs on your
-AKS. It binds Azure Active Directory identities to your Kubernetes pods. Identity is required for an application in a
-Kubernetes pod to be able to communicate with other Azure components. In the particular case here we need authorization
-for the AGIC pod to make HTTP requests to [ARM](https://docs.microsoft.com/en-us/azure/azure-resource-manager/resource-group-overview).
-
-Follow the [AAD Pod Identity installation instructions](https://github.com/Azure/aad-pod-identity#deploy-the-azure-aad-identity-infra) to add this component to your AKS.
-
-Next we need to create an Azure identity and give it permissions ARM.
-Use [Cloud Shell](https://shell.azure.com/) to run all of the following commands and create an identity:
-
-1. Create an Azure identity **in the same resource group as the AKS nodes**. Picking the correct resource group is
-important. The resource group required in the command below is *not* the one referenced on the AKS portal pane. This is
-the resource group of the `aks-agentpool` virtual machines. Typically that resource group starts with `MC_` and contains
- the name of your AKS. For instance: `MC_resourceGroup_aksABCD_westus`
-
-    ```bash
-    az identity create -g <agent-pool-resource-group> -n <identity-name>
-    ```
-
-1. For the role assignment commands below we need to obtain `principalId` for the newly created identity:
-
-    ```bash
-    az identity show -g <resourcegroup> -n <identity-name>
-    ```
-
-1. Give the identity `Contributor` access to you App Gateway. For this you need the ID of the App Gateway, which will
-look something like this: `/subscriptions/A/resourceGroups/B/providers/Microsoft.Network/applicationGateways/C`
-
-    Get the list of App Gateway IDs in your subscription with: `az network application-gateway list --query '[].id'`
-
-    ```bash
-    az role assignment create \
-        --role Contributor \
-        --assignee <principalId> \
-        --scope <App-Gateway-ID>
-    ```
-
-1. Give the identity `Reader` access to the App Gateway resource group. The resource group ID would look like:
-`/subscriptions/A/resourceGroups/B`. You can get all resource groups with: `az group list --query '[].id'`
-
-    ```bash
-    az role assignment create \
-        --role Reader \
-        --assignee <principalId> \
-        --scope <App-Gateway-Resource-Group-ID>
-    ```
-
-### Using a Service Principal
-It is also possible to provide AGIC access to ARM via a Kubernetes secret.
-
-  1. Create an Active Directory Service Principal and encode with base64. The base64 encoding is required for the JSON
-  blob to be saved to Kubernetes.
-
-  ```bash
-  az ad sp create-for-rbac --subscription <subscription-uuid> --sdk-auth | base64 -w0
-  ```
-
-  2. Add the base64 encoded JSON blob to the `helm-config.yaml` file. More information on `helm-config.yaml` is in the
-  next section.
-   ```yaml
-   armAuth:
-       type: servicePrincipal
-       secretJSON: <Base64-Encoded-Credentials>
-   ```
-
-## Install Ingress Controller as a Helm Chart
-In the first few steps we install Helm's Tiller on your Kubernetes cluster. Use [Cloud Shell](https://shell.azure.com/) to install the AGIC Helm package:
-
-1. Add the `application-gateway-kubernetes-ingress` helm repo and perform a helm update
-
+1. Add the AGIC Helm repository:
     ```bash
     helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
     helm repo update
     ```
 
-1. Download [helm-config.yaml](../examples/sample-helm-config.yaml), which will configure AGIC:
+1. Install AGIC:
     ```bash
-    wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/docs/examples/sample-helm-config.yaml -O helm-config.yaml
+    applicationGatewayId=$(az network application-gateway show -n $applicationGatewayName -g $applicationGatewayGroupName -o tsv --query "id")
+
+    helm install application-gateway-kubernetes-ingress/ingress-azure \
+      --set appgw.applicationGatewayID=$applicationGatewayId \
+      --set armAuth.type=aadPodIdentity \
+      --set armAuth.identityResourceID=$identityResourceId \
+      --set armAuth.identityClientID=$identityClientId \
+      --version 0.10.0-rc5
     ```
-
-1. Edit [helm-config.yaml](../examples/sample-helm-config.yaml) and fill in the values for `appgw` and `armAuth`.
-    ```bash
-    nano helm-config.yaml
-    ```
-
-    **NOTE:** The `<identity-resource-id>` and `<identity-client-id>` are the properties of the Azure AD Identity you setup in the previous section. You can retrieve this information by running the following command: `az identity show -g <resourcegroup> -n <identity-name>`, where `<resourcegroup>` is the resource group in which the top level AKS cluster object, Application Gateway and Managed Identify are deployed.
-
-1. Install Helm chart `application-gateway-kubernetes-ingress` with the `helm-config.yaml` configuration from the previous step
-
-    ```bash
-    helm install -f <helm-config.yaml> application-gateway-kubernetes-ingress/ingress-azure
-    ```
-
-    Alternatively you can combine the `helm-config.yaml` and the Helm command in one step:
-    ```bash
-    helm install ./helm/ingress-azure \
-         --name ingress-azure \
-         --namespace default \
-         --debug \
-         --set appgw.name=applicationgatewayABCD \
-         --set appgw.resourceGroup=your-resource-group \
-         --set appgw.subscriptionId=subscription-uuid \
-         --set appgw.shared=false \
-         --set armAuth.type=servicePrincipal \
-         --set armAuth.secretJSON=$(az ad sp create-for-rbac --subscription <subscription-uuid> --sdk-auth | base64 -w0) \
-         --set rbac.enabled=true \
-         --set verbosityLevel=3 \
-         --set kubernetes.watchNamespace=default \
-         --set aksClusterConfiguration.apiServerAddress=aks-abcdefg.hcp.westus2.azmk8s.io
-    ```
-
-1. Check the log of the newly created pod to verify if it started properly
 
 Refer to the [tutorials](../tutorial.md) to understand how you can expose an AKS service over HTTP or HTTPS, to the internet, using an Azure App Gateway.
 
